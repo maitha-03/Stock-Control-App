@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>SHALOM tests</title></head>
+<body>
+<pre id="out">RUNNING</pre>
+<iframe id="app" style="width:1280px;height:900px"></iframe>
+<script src="../core.js"></script>
+<script>
+(async function () {
+  const out = [];
+  let fails = 0;
+  const ok = (cond, msg) => { out.push((cond ? 'PASS ' : 'FAIL ') + msg); if (!cond) fails++; };
+  const throwsMsg = async (fn) => { try { await fn(); return null; } catch (e) { return e.message; } };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const C = window.ShalomCore;
+  try {
+    // ---------------------------------------------------------------- logic tests (separate DB key)
+    localStorage.clear();
+    const b = new C.LocalBackend('test_db');
+    await b.init();
+    let who = null;
+    const L = C.Logic(b, () => who);
+    const adminUid = await b.createFirstAdmin('owner', 'secret1', { name: 'Shop Owner' });
+    who = { uid: adminUid, name: 'Shop Owner', role: 'admin' };
+    ok(!!(await b.get('meta', 'setup')), 'first admin setup recorded');
+    ok(!!(await throwsMsg(() => b.createFirstAdmin('x', 'secret1', { name: 'X' }))), 'second admin setup is refused');
+
+    // 1. register product
+    const p = await L.addProduct({ name: 'Sugar 1kg', category: 'Foodstuffs', buyPrice: 150, sellPrice: 180, qty: 20, minStock: 5 });
+    ok(p.id === 'P0001', '1. product registered with auto ID ' + p.id);
+    const p2 = await L.addProduct({ name: 'Bread', category: 'Foodstuffs', buyPrice: 50, sellPrice: 65, qty: 3, minStock: 5 });
+    ok(p2.id === 'P0002', 'second product gets next ID ' + p2.id);
+    ok((await throwsMsg(() => L.addProduct({ name: '', buyPrice: 1, sellPrice: 2, qty: 1 }))) !== null, 'product without name rejected');
+
+    // seller account
+    const sellerUid = await L.createUser({ name: 'Jane Seller', username: 'jane', password: 'pass123', role: 'seller' });
+    ok(!!(await b.get('users', sellerUid)), 'seller account created');
+    ok((await throwsMsg(() => L.createUser({ name: 'Dup', username: 'jane', password: 'pass123' }))) === 'That username is already taken.', 'duplicate username rejected');
+    who = { uid: sellerUid, name: 'Jane Seller', role: 'seller' };
+    ok((await throwsMsg(() => L.addProduct({ name: 'X', buyPrice: 1, sellPrice: 2, qty: 1 }))) === 'Only the administrator can do this.', 'seller cannot add products');
+
+    // 2. record a sale (paid in full)
+    const sid = C.genId();
+    const s1 = await L.completeSale(sid, [{ productId: 'P0001', qty: 3 }, { productId: 'P0002', qty: 1 }], { amountPaid: 1000, method: 'Cash' });
+    ok(s1.total === 605, '2. sale total 3x180 + 65 = 605 (got ' + s1.total + ')');
+    ok(s1.change === 395, 'change 1000 - 605 = 395 (got ' + s1.change + ')');
+    ok(s1.paymentStatus === 'paid' && s1.balanceDue === 0, 'sale marked PAID FULL');
+    ok(/^SGS-\d{8}-00001$/.test(s1.receiptNo), 'unique receipt number ' + s1.receiptNo);
+    // 3. stock reduced
+    ok((await b.get('products', 'P0001')).qty === 17 && (await b.get('products', 'P0002')).qty === 2, '3. stock reduced automatically (20->17, 3->2)');
+    // duplicate prevention
+    ok(/already recorded/.test(await throwsMsg(() => L.completeSale(sid, [{ productId: 'P0001', qty: 1 }], { amountPaid: 180, method: 'Cash' }))), 'same sale cannot be recorded twice');
+    ok((await b.get('products', 'P0001')).qty === 17, 'duplicate attempt did not deduct stock');
+    // 6. profit
+    ok(s1.profit === 3 * 30 + 15, '6. profit = (180-150)x3 + (65-50)x1 = 105 (got ' + s1.profit + ')');
+    // 10. overselling prevented
+    const over = await throwsMsg(() => L.completeSale(C.genId(), [{ productId: 'P0002', qty: 5 }], { amountPaid: 500, method: 'Cash' }));
+    ok(/Not enough stock/.test(over || ''), '10. selling more than available is blocked: ' + over);
+    ok((await b.get('products', 'P0002')).qty === 2, 'blocked sale changed nothing');
+
+    // debts: partial payment requires name + phone
+    const noName = await throwsMsg(() => L.completeSale(C.genId(), [{ productId: 'P0001', qty: 2 }], { amountPaid: 100, method: 'M-Pesa' }));
+    ok(/full name/.test(noName || ''), 'partial payment without customer name rejected');
+    const s2 = await L.completeSale(C.genId(), [{ productId: 'P0001', qty: 2 }], { amountPaid: 100, method: 'M-Pesa', customerName: 'Mary Wanjiku', customerPhone: '0712345678' });
+    ok(s2.paymentStatus === 'partial' && s2.balanceDue === 260, 'partial sale recorded as debt, balance 260 (got ' + s2.balanceDue + ')');
+    ok(s2.sellerName === 'Jane Seller', 'debt shows who sold to the client');
+    const left = await L.recordPayment(s2.id, 200, 'Cash');
+    ok(left === 60, 'debt payment reduces balance to 60 (got ' + left + ')');
+    ok((await throwsMsg(() => L.recordPayment(s2.id, 100, 'Cash'))) !== null, 'cannot overpay a debt');
+    await L.recordPayment(s2.id, 60, 'Cash');
+    const s2b = await b.get('sales', s2.id);
+    ok(s2b.paymentStatus === 'paid' && s2b.balanceDue === 0 && s2b.payments.length === 3, 'debt cleared after full payment');
+
+    // reports
+    const all = Object.values(b.exportAll().sales);
+    const t0 = new Date(); t0.setHours(0, 0, 0, 0);
+    const sm = C.Reports.summarize(C.Reports.between(all, t0.getTime(), t0.getTime() + 86400000));
+    ok(sm.revenue === 965 && sm.profit === 165 && sm.cost === 800, '5. daily figures: revenue 965, cost 800, profit 165 (got ' + sm.revenue + '/' + sm.cost + '/' + sm.profit + ')');
+    ok(C.Reports.collected(all, t0.getTime(), t0.getTime() + 86400000) === 965, 'money collected today counts debt repayments (965)');
+    const best = C.Reports.bestSeller(all);
+    ok(best && best.name === 'Sugar 1kg' && best.qty === 5, 'best seller is Sugar (5 units)');
+
+    // price change keeps historical profit
+    who = { uid: adminUid, name: 'Shop Owner', role: 'admin' };
+    await L.adjustStock('P0001', 'add', 10, 'Supplier delivery', 160);
+    ok((await b.get('products', 'P0001')).qty === 25 && (await b.get('products', 'P0001')).buyPrice === 160, 'restock +10 with new buying price');
+    ok((await b.get('sales', sid)).items[0].unitCost === 150, 'old sale keeps original buying price for profit');
+
+    // reversal
+    ok((await throwsMsg(async () => { who = { uid: sellerUid, name: 'Jane Seller', role: 'seller' }; await L.reverseSale(sid, 'test'); })) === 'Only the administrator can do this.', 'seller cannot reverse sales');
+    who = { uid: adminUid, name: 'Shop Owner', role: 'admin' };
+    await L.reverseSale(sid, 'Entered by mistake');
+    ok((await b.get('products', 'P0001')).qty === 28 && (await b.get('products', 'P0002')).qty === 3, 'reversal returns stock');
+    ok(Object.values(b.exportAll().audit).some((a) => a.action === 'sale_reversed'), 'reversal recorded in audit trail');
+
+    // messages
+    const m1 = await L.sendMessage(sellerUid, 'Please recount sugar');
+    who = { uid: sellerUid, name: 'Jane Seller', role: 'seller' };
+    const r1 = await L.sendMessage('ignored', 'Done, 28 bags', m1.threadId);
+    ok(r1.toUid === 'admins' && r1.threadId === m1.threadId, 'seller reply goes to admin in same thread');
+    await L.markRead([m1.id]);
+    ok((await b.get('messages', m1.id)).readBy[sellerUid] === true, 'message marked as read');
+
+    // ---- units of measure, money-amount sales and sacks/bales
+    who = { uid: adminUid, name: 'Shop Owner', role: 'admin' };
+    const rice = await L.addProduct({ name: 'Rice', category: 'Foodstuffs', unit: 'kg', buyPrice: 100, sellPrice: 140, qty: 2, qtyIn: 'pack', minStock: 5, packEnabled: true, packName: 'sack', packSize: 25, packPrice: 3300 });
+    ok(rice.qty === 50 && rice.unit === 'kg', 'UNITS: 2 sacks of 25 kg recorded as 50 kg');
+    who = { uid: sellerUid, name: 'Jane Seller', role: 'seller' };
+    const rs = await L.completeSale(C.genId(), [{ productId: rice.id, mode: 'sub', value: 500 }, { productId: rice.id, mode: 'amount', value: 35 }, { productId: rice.id, mode: 'pack', value: 1 }], { amountPaid: 3405, method: 'Cash' });
+    ok(rs.total === 3405, 'UNITS: 500 g (70) + KSh 35 worth (35) + 1 sack (3300) = 3405 (got ' + rs.total + ')');
+    ok(rs.items[0].qtyText === '500 g' && rs.items[1].qtyText === '0.25 kg' && rs.items[2].qtyText === '1 sack (25 kg)', 'UNITS: receipt lines read "500 g", "0.25 kg", "1 sack (25 kg)" (got ' + rs.items.map((l) => l.qtyText).join(' | ') + ')');
+    ok((await b.get('products', rice.id)).qty === 24.25, 'UNITS: stock 50 kg - 25.75 kg = 24.25 kg');
+    ok(rs.profit === 830, 'UNITS: profit 20 + 10 + 800 = 830 (got ' + rs.profit + ')');
+    ok(/Not enough stock/.test(await throwsMsg(() => L.completeSale(C.genId(), [{ productId: rice.id, mode: 'pack', value: 1 }], { amountPaid: 3300, method: 'Cash' })) || ''), 'UNITS: cannot sell a full sack when only 24.25 kg is left');
+    who = { uid: adminUid, name: 'Shop Owner', role: 'admin' };
+    const bale = await L.addProduct({ name: 'Mitumba T-shirts', category: 'Other', unit: 'pcs', buyPrice: 40, sellPrice: 100, qty: 2, qtyIn: 'pack', minStock: 10, packEnabled: true, packName: 'bale', packSize: 50, packPrice: 4500 });
+    ok(bale.qty === 100 && C.stockText(bale) === '100 pcs (2 bales)', 'BALES: 2 bales = 100 pcs, shown as "' + C.stockText(bale) + '"');
+    who = { uid: sellerUid, name: 'Jane Seller', role: 'seller' };
+    const bs = await L.completeSale(C.genId(), [{ productId: bale.id, mode: 'pack', value: 1 }, { productId: bale.id, mode: 'unit', value: 3 }], { amountPaid: 4800, method: 'M-Pesa' });
+    ok(bs.total === 4800 && bs.profit === 4800 - 53 * 40, 'BALES: 1 bale (4500) + 3 pcs (300) = 4800, profit ' + bs.profit);
+    ok(C.stockText(await b.get('products', bale.id)) === '47 pcs', 'BALES: 47 pcs left');
+    ok(/whole/.test(await throwsMsg(() => L.completeSale(C.genId(), [{ productId: bale.id, mode: 'unit', value: 1.5 }], { amountPaid: 150, method: 'Cash' })) || ''), 'BALES: half a piece is rejected');
+    who = { uid: adminUid, name: 'Shop Owner', role: 'admin' };
+    await L.adjustStock(bale.id, 'add', 2, 'New bales', '', 'pack');
+    ok(C.stockText(await b.get('products', bale.id)) === '147 pcs (2 bales + 47 pcs)', 'BALES: restock 2 bales -> "' + C.stockText(await b.get('products', bale.id)) + '"');
+
+    // ---- salaries & commission
+    await L.adminUpdateUser(sellerUid, { salary: 15000, salaryPeriod: 'monthly', commissionRate: 10 });
+    ok((await b.get('users', sellerUid)).commissionRate === 10, 'PAY: salary and commission rate saved');
+    const pay = await L.payStaff({ id: 'sal_' + sellerUid + '_M2026-11', sellerId: sellerUid, type: 'salary', amount: 15000, method: 'M-Pesa', periodLabel: 'Nov 2026', message: 'Salary paid' });
+    ok(pay.status === 'paid' && pay.sellerName === 'Jane Seller', 'PAY: salary recorded');
+    ok(/Already paid/.test(await throwsMsg(() => L.payStaff({ id: 'sal_' + sellerUid + '_M2026-11', sellerId: sellerUid, type: 'salary', amount: 15000, method: 'Cash' })) || ''), 'PAY: same salary period cannot be paid twice');
+    ok(Object.values(b.exportAll().messages).some((m) => m.toUid === sellerUid && m.kind === 'payment'), 'PAY: seller is notified by message');
+    who = { uid: sellerUid, name: 'Jane Seller', role: 'seller' };
+    ok((await throwsMsg(() => L.payStaff({ sellerId: sellerUid, type: 'bonus', amount: 1 }))) === 'Only the administrator can do this.', 'PAY: seller cannot pay staff');
+    await L.confirmReceived(pay.id);
+    ok(!!(await b.get('payroll', pay.id)).receivedAt, 'PAY: seller confirms money received');
+    who = { uid: adminUid, name: 'Shop Owner', role: 'admin' };
+    await L.voidPayment(pay.id, 'Wrong amount');
+    await L.payStaff({ id: pay.id, sellerId: sellerUid, type: 'salary', amount: 14000, method: 'Cash' });
+    ok((await b.get('payroll', pay.id)).amount === 14000, 'PAY: cancelled payment can be re-paid correctly');
+    ok(C.Reports.staffCost(Object.values(b.exportAll().payroll), 0, Date.now() + 1000) === 14000, 'PAY: staff costs exclude cancelled payments (14000)');
+    const bySeller = C.Reports.bySeller(Object.values(b.exportAll().sales));
+    ok(bySeller.length === 1 && bySeller[0].name === 'Jane Seller', 'TEAM: sales grouped by seller');
+
+    // 8. persistence: new backend instance reads same storage
+    const b2 = new C.LocalBackend('test_db');
+    ok(Object.keys(b2.exportAll().sales).length === 4 && (await b2.get('products', 'P0001')).qty === 28, '8. records persist after reload');
+  } catch (e) {
+    ok(false, 'logic test crashed: ' + e.stack);
+  }
+
+  // ---------------------------------------------------------------- UI tests (real app in iframe)
+  try {
+    localStorage.clear();
+    const frame = document.getElementById('app');
+    const load = () => new Promise((r) => { frame.onload = r; frame.src = '../index.html?' + Date.now(); });
+    await load();
+    const W = () => frame.contentWindow;
+    const D = () => frame.contentDocument;
+    const errors = [];
+    const hook = () => { W().addEventListener('error', (e) => errors.push(e.message)); W().addEventListener('unhandledrejection', (e) => errors.push(String(e.reason && e.reason.message || e.reason))); W().print = () => { W().__printed = (W().__printed || 0) + 1; }; };
+    hook();
+    const waitFor = async (fn, ms) => { const end = Date.now() + (ms || 5000); while (Date.now() < end) { try { const v = fn(); if (v) return v; } catch (e) {} await sleep(50); } return null; };
+    const setVal = (el, v) => { el.value = v; const Ev = W().Event; el.dispatchEvent(new Ev('input', { bubbles: true })); el.dispatchEvent(new Ev('change', { bubbles: true })); };
+
+    const form = await waitFor(() => D().querySelector('#authForm [name=username]') && D().querySelector('#authForm'));
+    ok(!!form && !D().querySelector('#authForm [name=password2]') && !/Set up/i.test(D().body.textContent), 'UI: login page only (no set-up page)');
+    ok(D().querySelector('.auth-credit') && D().querySelector('.auth-credit').textContent.includes('Engineer Maitha'), 'UI: designer credit on login page');
+    setVal(form.elements.username, 'admin'); setVal(form.elements.password, 'wrongpass');
+    form.requestSubmit();
+    ok(!!(await waitFor(() => /Wrong username or password/.test(D().querySelector('#authErr').textContent))), 'UI: wrong password rejected');
+    setVal(form.elements.username, 'admin'); setVal(form.elements.password, 'admin2026admin2026');
+    form.requestSubmit();
+    ok(!!(await waitFor(() => D().querySelector('#dStats .stat'))), 'UI: built-in admin logs in with admin / admin2026admin2026');
+    const pwModal = await waitFor(() => D().querySelector('.modal') && /default/.test(D().querySelector('.modal').textContent) && D().querySelector('.modal'));
+    ok(!!pwModal, 'UI: admin reminded to change the default password');
+    if (pwModal) pwModal.querySelector('[data-x]').click();
+    const A = () => W().ShalomApp;
+    // add product through dialog
+    W().location.hash = '#products';
+    await waitFor(() => D().querySelector('#pAdd'));
+    D().querySelector('#pAdd').click();
+    const pf = await waitFor(() => D().querySelector('#prodForm'));
+    setVal(pf.elements.name, 'Cooking Oil 1L'); setVal(pf.elements.buyPrice, '250'); setVal(pf.elements.sellPrice, '300'); setVal(pf.elements.qty, '10'); setVal(pf.elements.minStock, '3');
+    D().querySelector('.modal [data-ok]').click();
+    ok(!!(await waitFor(() => A().S.products.find((p) => p.name === 'Cooking Oil 1L'))), 'UI: product added via form');
+    ok(!!(await waitFor(() => D().querySelector('#pTable') && D().querySelector('#pTable').textContent.includes('Cooking Oil 1L'))), 'UI: product listed in table');
+    // sale through POS
+    W().location.hash = '#sale';
+    const item = await waitFor(() => D().querySelector('.pos-item[data-pid="P0001"]'));
+    item.click(); item.click();
+    await sleep(100);
+    const pay = D().querySelector('#posPay');
+    setVal(pay.elements.paid, '1000');
+    await sleep(100);
+    pay.requestSubmit();
+    const rc = await waitFor(() => D().querySelector('.modal .receipt'));
+    ok(!!rc && rc.textContent.includes('KARIBU TENA') && rc.textContent.includes('SHALOM GENERAL STORE'), 'UI: receipt generated with shop name and footer');
+    ok(!!rc && rc.textContent.includes('Designed By: Engineer Maitha') && rc.textContent.includes('+254711829800'), 'UI: receipt shows designer credit');
+    ok(D().querySelector('.app-footer') && D().querySelector('.app-footer').textContent.includes('maithajoseph2003@gmail.com'), 'UI: designer credit at bottom of app pages');
+    ok(!!rc && rc.textContent.includes('600.00') && rc.textContent.includes('400.00'), 'UI: receipt shows total 600 and change 400');
+    D().querySelector('.modal [data-print]').click();
+    await sleep(200);
+    ok(W().__printed === 1 && D().querySelector('#printArea .receipt'), '7. UI: print receipt triggered with receipt content');
+    ok(await waitFor(() => A().S.products.find((p) => p.id === 'P0001').qty === 8), 'UI: stock 10 -> 8 after sale');
+    D().querySelector('.modal .close').click();
+    // partial payment UI
+    D().querySelector('.pos-item[data-pid="P0001"]').click();
+    await sleep(80);
+    setVal(D().querySelector('#posPay').elements.paid, '100');
+    await sleep(80);
+    ok(!D().querySelector('#debtorBox').classList.contains('hidden'), 'UI: underpayment shows customer name/phone section');
+    D().querySelector('#posPay').requestSubmit();
+    await sleep(200);
+    ok(/full name/.test(D().querySelector('#posErr').textContent), 'UI: sale blocked until customer name entered');
+    setVal(D().querySelector('#posPay').elements.name, 'Peter Otieno');
+    setVal(D().querySelector('#posPay').elements.phone, '0722000111');
+    D().querySelector('#posPay').requestSubmit();
+    ok(!!(await waitFor(() => D().querySelector('.modal .receipt') && D().querySelector('.modal').textContent.includes('Balance owed'))), 'UI: debt sale completed, balance owed shown');
+    D().querySelector('.modal .close').click();
+    // 4. sales history
+    W().location.hash = '#sales';
+    ok(!!(await waitFor(() => D().querySelectorAll('#shTable tbody tr').length === 2)), '4. UI: both sales appear in Sales History');
+    ok(D().querySelector('#shTable').textContent.includes('PAID FULL') && D().querySelector('#shTable').textContent.includes('PART PAID'), 'UI: history shows paid-in-full vs part-paid status');
+    // debts tab
+    W().location.hash = '#debts';
+    ok(!!(await waitFor(() => D().querySelector('#dbTable') && D().querySelector('#dbTable').textContent.includes('Peter Otieno') && D().querySelector('#dbTable').textContent.includes('Administrator'))), 'UI: Debts tab lists debtor and who sold');
+    // 9. admin can open reports
+    for (const r of ['dashboard', 'products', 'stock', 'sale', 'sales', 'receipts', 'debts', 'profit', 'daily', 'messages', 'users', 'settings', 'theme', 'profile', 'team', 'payroll']) {
+      W().location.hash = '#' + r;
+      await sleep(150);
+      ok(A().S.route === r && D().querySelector('#view').children[0].innerHTML.length > 100, 'UI: view "' + r + '" renders');
+    }
+    ok(!D().querySelector('.mode-strip') && !D().body.textContent.includes('DEMO MODE') && !D().body.textContent.includes('Demo mode'), 'UI: no demo-mode banner shown');
+    W().location.hash = '#theme';
+    await waitFor(() => D().querySelector('[data-accent="#2563eb"]'));
+    D().querySelector('[data-accent="#2563eb"]').click();
+    await sleep(80);
+    ok(D().documentElement.style.getPropertyValue('--green-600') === '#2563eb', 'UI: choosing Royal Blue changes the theme colour');
+    D().querySelector('[data-mode="dark"]').click();
+    await sleep(80);
+    ok(D().documentElement.dataset.mode === 'dark', 'UI: dark mode applies');
+    D().querySelector('[data-sidebar="light"]').click();
+    await sleep(80);
+    ok(D().documentElement.dataset.sidebar === 'light' && JSON.parse(W().localStorage.getItem('shalom_theme_v1')).accent === '#2563eb', 'UI: theme choices saved');
+    D().querySelector('#topMode').click();
+    await sleep(120);
+    ok(D().documentElement.dataset.mode === 'light', 'UI: top-bar button switches back to light mode');
+    W().location.hash = '#profit';
+    ok(!!(await waitFor(() => D().querySelector('#prTable') && D().querySelector('#prTable').textContent.includes('Cooking Oil 1L'))), '9. UI: admin sees profit report per product');
+    ok(D().querySelector('#prFixed').textContent.includes('150.00'), 'UI: profit today = (300-250) x 3 units = 150');
+    // kg product: seller types grams / taps quick amounts and the price is calculated
+    await A().S.logic.addProduct({ name: 'Sugar', category: 'Foodstuffs', unit: 'kg', buyPrice: 150, sellPrice: 180, qty: 50, minStock: 5, packEnabled: true, packName: 'bale', packSize: 24, packPrice: 4200 });
+    W().location.hash = '#sale';
+    const sug = await waitFor(() => D().querySelector('.pos-item[data-pid="P0002"]'));
+    ok(!!sug && sug.textContent.includes('50 kg (2 bales + 2 kg)') && !!sug.querySelector('[data-addpack]'), 'UI: POS shows "50 kg (2 bales + 2 kg)" and a "+ 1 bale" button');
+    sug.click();
+    await sleep(80);
+    const modeSel = D().querySelector('#posCart [data-mode]');
+    setVal(modeSel, 'sub');
+    await sleep(80);
+    D().querySelector('#posCart [data-chip][data-v="500"]').click();
+    await sleep(80);
+    ok(D().querySelector('#posCart [data-sub]').textContent.trim() === '90.00' && D().querySelector('#posCart [data-desc]').textContent.includes('500 g'), 'UI: 500 g of sugar at 180/kg = 90.00');
+    setVal(D().querySelector('#posCart [data-mode]'), 'amount');
+    await sleep(80);
+    setVal(D().querySelector('#posCart [data-val]'), '45');
+    await sleep(80);
+    ok(D().querySelector('#posCart [data-desc]').textContent.includes('0.25 kg'), 'UI: KSh 45 worth of sugar = 0.25 kg');
+    D().querySelector('.pos-item[data-pid="P0002"] [data-addpack]').click();
+    await sleep(80);
+    ok(D().querySelector('#posTotals').textContent.includes('4,245.00'), 'UI: + 1 bale (4,200) → total 4,245.00');
+    D().querySelector('#posClear').click();
+    await sleep(80);
+    const yes = D().querySelector('.modal [data-yes]'); if (yes) yes.click();
+    await sleep(80);
+    // create seller and message
+    const sellerUid = await A().S.logic.createUser({ name: 'John Seller', username: 'john', password: 'pass123', role: 'seller' });
+    await A().S.logic.sendMessage(sellerUid, 'Please count the oil');
+    // salaries: set pay settings and pay through the Salaries page
+    W().location.hash = '#payroll';
+    const setBtn = await waitFor(() => D().querySelector('#pySal [data-act="settings"][data-uid="' + sellerUid + '"]'));
+    setBtn.click();
+    const ps = await waitFor(() => D().querySelector('#psForm'));
+    setVal(ps.elements.salary, '12000'); setVal(ps.elements.commissionRate, '10');
+    D().querySelector('.modal [data-ok]').click();
+    const payBtn = await waitFor(() => D().querySelector('#pySal [data-act="paysal"]'));
+    ok(!!payBtn, 'UI: salary row shows Pay salary after settings saved');
+    payBtn.click();
+    const pyf = await waitFor(() => D().querySelector('#pyForm'));
+    ok(pyf && pyf.elements.amount.value === '12000', 'UI: pay dialog pre-filled with 12000');
+    D().querySelector('.modal [data-ok]').click();
+    ok(!!(await waitFor(() => A().S.payroll.length === 1 && D().querySelector('#pySal').textContent.includes('PAID'))), 'UI: salary marked PAID');
+    ok(!!(await waitFor(() => D().querySelector('#pyCom') && D().querySelector('#pyCom').textContent.includes('John Seller'))), 'UI: commission table lists sellers');
+    // 8. refresh keeps data & session
+    await load(); hook();
+    ok(!!(await waitFor(() => D().querySelector('#dStats .stat'))), '8. UI: after refresh still logged in');
+    ok(D().documentElement.style.getPropertyValue('--green-600') === '#2563eb', 'UI: theme kept after refresh');
+    ok(!!(await waitFor(() => W().ShalomApp.S.sales.length === 2 && W().ShalomApp.S.products.length === 2)), 'UI: after refresh all records still present');
+    // log out, log in as seller -> message popup, restricted nav
+    await W().ShalomApp.S.backend.signOut();
+    const lf = await waitFor(() => D().querySelector('#authForm [name=username]') && D().querySelector('#authForm'));
+    ok(!!lf && !D().querySelector('#authForm [name=password2]'), 'UI: login form shown after logout');
+    setVal(lf.elements.username, 'john'); setVal(lf.elements.password, 'pass123');
+    lf.requestSubmit();
+    ok(!!(await waitFor(() => D().querySelector('.modal.msg-pop') && D().querySelector('.modal.msg-pop').textContent.includes('Please count the oil'))), 'UI: seller sees message pop-up from admin');
+    D().querySelector('#popReply').value = 'Counted: 7 left';
+    D().querySelector('.modal [data-reply]').click();
+    ok(!!(await waitFor(() => W().ShalomApp.S.messages.some((m) => m.text === 'Counted: 7 left' && m.toUid === 'admins'))), 'UI: seller replied to admin');
+    ok(!D().querySelector('a[data-route=profit]') && !D().querySelector('a[data-route=users]'), 'UI: seller cannot see Profit/Users menu');
+    W().location.hash = '#profit';
+    await sleep(150);
+    ok(W().ShalomApp.S.route === 'dashboard', 'UI: seller redirected away from profit report');
+    ok(!!D().querySelector('a[data-route=team]') && !!D().querySelector('a[data-route=earnings]') && !D().querySelector('a[data-route=payroll]'), 'UI: seller has Team Sales and My Earnings, not Salaries');
+    W().location.hash = '#team';
+    ok(!!(await waitFor(() => D().querySelector('#tmTable') && D().querySelector('#tmTable').textContent.includes('Administrator') && D().querySelector('#tmTable').textContent.includes('900.00'))), 'UI: seller sees what other sellers have sold');
+    W().location.hash = '#sales';
+    ok(!!(await waitFor(() => D().querySelectorAll('#shTable tbody tr').length === 2)), "UI: seller sees other sellers' sales in history");
+    W().location.hash = '#earnings';
+    const conf = await waitFor(() => D().querySelector('#erTable [data-confirm]'));
+    ok(!!conf && D().querySelector('#erTable').textContent.includes('12,000.00'), 'UI: salary payment reflects in seller\'s My Earnings');
+    conf.click();
+    ok(!!(await waitFor(() => D().querySelector('#erTable').textContent.includes('Received'))), 'UI: seller confirms salary received');
+    ok(errors.length === 0, 'UI: no JavaScript errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
+  } catch (e) {
+    ok(false, 'UI test crashed: ' + e.stack);
+  }
+  document.getElementById('out').textContent = (fails ? 'RESULT: ' + fails + ' FAILED' : 'RESULT: ALL PASSED') + '\n' + out.join('\n');
+  document.getElementById('app').remove();
+})();
+</script>
+</body></html>

@@ -1,0 +1,108 @@
+rules_version = '2';
+// SHALOM GENERAL STORE - Firestore security rules.
+// Paste this whole file into Firebase console > Firestore Database > Rules, then click Publish.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function userDoc() { return get(/databases/$(database)/documents/users/$(request.auth.uid)); }
+    function active() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && userDoc().data.active == true;
+    }
+    function isAdmin() { return active() && userDoc().data.role == 'admin'; }
+    function changedOnly(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+    // ---- one-time setup marker (readable so the login page knows whether to show "Set up the shop")
+    match /meta/setup {
+      allow read: if true;
+      allow create: if signedIn()
+        && !exists(/databases/$(database)/documents/meta/setup)
+        && request.resource.data.adminUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+    match /meta/settings {
+      allow read: if active();
+      allow write: if isAdmin();
+    }
+    // receipt / product number counters (sellers increment the sale counter inside a sale transaction)
+    match /meta/counters {
+      allow read, write: if active();
+    }
+
+    match /users/{uid} {
+      allow read: if active() || request.auth.uid == uid;
+      allow create: if isAdmin()
+        || (request.auth.uid == uid
+            && request.resource.data.role == 'admin'
+            && request.resource.data.active == true
+            && !exists(/databases/$(database)/documents/meta/setup)
+            && getAfter(/databases/$(database)/documents/meta/setup).data.adminUid == uid);
+      allow update: if isAdmin()
+        || (active() && request.auth.uid == uid && changedOnly(['name', 'phone', 'photo', 'mustChangePassword']));
+      allow delete: if false;
+    }
+
+    match /products/{id} {
+      allow read: if active();
+      allow create, delete: if isAdmin();
+      // sellers may only reduce quantity (a sale); everything else is admin-only
+      allow update: if isAdmin()
+        || (active()
+            && changedOnly(['qty', 'updatedAt'])
+            && request.resource.data.qty is number
+            && request.resource.data.qty >= 0
+            && request.resource.data.qty < resource.data.qty);
+    }
+
+    match /sales/{id} {
+      // every active user can see all sales (team sales); profit figures are only shown to the admin in the app
+      allow read: if active();
+      allow create: if active()
+        && request.resource.data.sellerId == request.auth.uid
+        && request.resource.data.reversed == false;
+      // sellers may record debt payments / customer details on their own sales; reversal is admin-only
+      allow update: if isAdmin()
+        || (active()
+            && resource.data.sellerId == request.auth.uid
+            && resource.data.reversed == false
+            && changedOnly(['payments', 'amountApplied', 'balanceDue', 'paymentStatus', 'clearedAt', 'updatedAt', 'customerName', 'customerPhone']));
+      allow delete: if false; // sales are permanent; use reversal
+    }
+
+    match /stockMoves/{id} {
+      allow read: if isAdmin();
+      allow create: if active() && request.resource.data.by == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /audit/{id} {
+      allow read: if isAdmin();
+      allow create: if active() && request.resource.data.by == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // salaries, commission and other staff payments
+    match /payroll/{id} {
+      allow read: if isAdmin() || (active() && (resource == null || resource.data.sellerId == request.auth.uid));
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin()
+        || (active() && resource.data.sellerId == request.auth.uid && changedOnly(['receivedAt']));
+    }
+
+    match /messages/{id} {
+      allow read: if isAdmin()
+        || (active() && (resource.data.toUid == request.auth.uid
+                         || resource.data.toUid == 'all'
+                         || resource.data.fromUid == request.auth.uid));
+      allow create: if active()
+        && request.resource.data.fromUid == request.auth.uid
+        && (isAdmin() || request.resource.data.toUid == 'admins');
+      allow update: if active() && changedOnly(['readBy']);
+      allow delete: if isAdmin();
+    }
+  }
+}
